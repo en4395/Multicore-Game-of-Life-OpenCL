@@ -91,4 +91,62 @@ const char *gpuKernelSource = R"(
         }
 )";
 
+const char *cpuKernelSource = R"(
+        __kernel void writeToPixelBuffer(__global const int* species_data,
+                                __global uchar3 *pixel_buffer,
+                                const int width, const int height) {
+
+            int x = get_global_id(0);
+            int y = get_global_id(1);
+
+            // Return if (x, y) is outside of grid
+            if (x >= width || y >= height) return;
+
+            // Get linear cell index
+            int cellIndex = y * width + x;
+
+            int speciesID = species_data[cellIndex];
+            uchar3 cellColour;
+            switch(speciesID) {
+                case -1:
+                    cellColour = (uchar3)(53,27,8);     // DEAD: Saddle brown
+                    break;
+                case 1:
+                    cellColour = (uchar3)(216,191,216); // SPECIES 1: Thistle
+                    break;
+                case 2:
+                    cellColour = (uchar3)(95,158,160);  // SPECIES 2: Cadet blue
+                    break;
+                case 3:
+                    cellColour = (uchar3)(46,139,87);   // SPECIES 3: Sea green
+                    break;
+                case 4:
+                    cellColour = (uchar3)(245,222,179); // SPECIES 4: Wheat
+                    break;
+                case 5:
+                    cellColour = (uchar3)(189,183,107); // SPECIES 5: Dark khaki
+                    break;
+                case 6:
+                    cellColour = (uchar3)(255,215,0);   // SPECIES 6: Gold
+                    break;
+                case 7:
+                    cellColour = (uchar3)(255,69,0);    // SPECIES 7: Orange red
+                    break;
+                case 8:
+                    cellColour = (uchar3)(178,34,34);   // SPECIES 8: Firebrick
+                    break;
+                case 9:
+                    cellColour = (uchar3)(219,112,147); // SPECIES 9: Pale violet red
+                    break;
+                case 10:
+                    cellColour = (uchar3)(139,0,0);     // SPECIES 10: Dark red
+                    break;
+                default:
+                    cellColour = (uchar3)(255, 0, 255); // ERROR: Magenta
+            }
+
+            pixel_buffer[cellIndex] = cellColour;
+        }
+)";
+
 #endif
