@@ -1,7 +1,10 @@
 #include <iostream>
-#include <OpenCL/opencl.h>
-#include <GLUT/glut.h>
+#include <GL/glew.h>
+#include <GL/freeglut.h>
 #include <OpenGL/OpenGL.h>
+#include <OpenGL/glu.h>
+#include <OpenCL/opencl.h>
+//#include <OpenCL/cl_gl.h>
 #include <thread>
 
 #include "Configs.h"
@@ -89,7 +92,6 @@ void initialiseOpenCL() {
     }
 
     // ----------- GPU KERNEL ----------- //
-
     // Create the compute program from the source character array
     gpu_program = clCreateProgramWithSource(context, 1, (const char **)&gpuKernelSource, NULL, &err);
     if (!gpu_program) {
@@ -240,8 +242,15 @@ void initialiseOpenGL(int argc, char** argv) {
     glutInit(&argc, argv);
     glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGB);
     glutInitWindowSize(WIDTH, HEIGHT);
-    glutInitWindowPosition(100, 100);   // Position of window on screen
+    glutInitWindowPosition(100, 100);
     glutCreateWindow("Game of Life");
+
+    // Initialise GLEW
+    GLenum err = glewInit();
+    if (GLEW_OK != err) {
+        std::cerr << "GLEW Error: " << glewGetErrorString(err) << std::endl;
+        return;
+    }
 
     // Set up pixel buffer object
     gridData = new GLubyte[WIDTH * HEIGHT * 3];
@@ -268,8 +277,8 @@ void displayFunc() {
 
 void idleFunc() {
     updateGridState();
-    setPixelsNoCL();
-    //setPixels();
+    //setPixelsNoCL();
+    setPixels();
     glutPostRedisplay();
 }
 
