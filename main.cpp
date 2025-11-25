@@ -1,11 +1,17 @@
+/**
+ * References:
+ * - OpenCL initialisation, kernel, and function calls: https://developer.apple.com/library/archive/samplecode/OpenCL_Hello_World_Example/Listings/hello_c.html#//apple_ref/doc/uid/DTS40008187-hello_c-DontLinkElementID_4
+ * - Pseudo-random next species selection: https://www.reedbeta.com/blog/hash-functions-for-gpu-rendering/
+ *      - I used the 32-bit PCG hash algorithm, which the author credited to Jarzynski and Olano
+ *      - The family of PCG (permuted congruential generator) algorithms was developed by M.E. O'Neill
+ * - Creating and using Pixel Buffer Objects (PBOs): https://www.songho.ca/opengl/gl_vbo.html#create
+ * - Profiling with events: Lecture slides
+ **/
+
 #include <iostream>
-#include <GL/glew.h>
-#include <GL/freeglut.h>
+#include <GLUT/glut.h>
 #include <OpenGL/OpenGL.h>
-#include <OpenGL/glu.h>
 #include <OpenCL/opencl.h>
-//#include <OpenCL/cl_gl.h>
-#include <thread>
 
 #include "Configs.h"
 #include "KernelSource.h"
@@ -13,23 +19,25 @@
 // ----------- OPENCL ----------- //
 cl_device_id device_id;
 cl_context context;
-cl_command_queue commands;
+cl_command_queue gpu_commands;
+cl_command_queue cpu_commands;
 cl_program gpu_program;
 cl_program cpu_program;
 cl_kernel grid_update_kernel;
 cl_kernel pixels_update_kernel;
-cl_mem old_species_ids_mem;
-cl_mem species_ids_mem;
+cl_mem grid_mem;
+cl_mem grid_cpu_mem;
+cl_mem next_grid_mem;
 cl_mem pixel_buffer_mem;
 void initialiseOpenCL();
 void cleanupOpenCL();
 
 // ----------- GAME OF LIFE ----------- //
-std::vector<int> oldSpeciesIDs; // Previous species IDs
-std::vector<int> speciesIDs;    // Updated species IDs
-GLubyte* gridData = nullptr;    // CPU pixel buffer
+std::vector<int> grid;          // Previous species IDs
+std::vector<int> nextGrid;      // Updated species IDs
+int getDesiredNumberOfSpecies();
 void initialiseGrid();
-void updateGridState();
+uint playGameOfLife();
 
 // ----------- OPENGL ----------- //
 GLuint pixelBuffer;
@@ -37,10 +45,22 @@ void initialiseOpenGL(int argc, char** argv);
 void displayFunc();             // Display callback
 void idleFunc();                // Idle callback
 void keyboardFunc(unsigned char key, int x, int y); // Keyboard callback
-void setPixels();
-void setPixelsNoCL();
+
+// ----------- TEST VARIABLES ----------- //
+bool testModeEnabled = true;
+std::vector<double>hostWaitTimeus;
+std::vector<double>kernelExecutionTimeus;
+int iteration = 0;
+int MAX_ITERATIONS = 100;
 
 int main(int argc, char** argv) {
+    NUMBER_OF_SPECIES = getDesiredNumberOfSpecies();
+
+    if(testModeEnabled) {
+        // Initialise test buffers
+        hostWaitTimeus.resize(MAX_ITERATIONS);
+        kernelExecutionTimeus.resize(MAX_ITERATIONS);
+    }
 
     // Register cleanup function
     atexit(cleanupOpenCL);
@@ -51,133 +71,137 @@ int main(int argc, char** argv) {
 
     glutMainLoop();
 
-    cleanupOpenCL();
-
     return 0;
 }
 
 void initialiseOpenCL() {
-    cl_int err;
+    cl_int err[2];
 
-    // ----------- SHARED FOR NOW ----------- //
     // Connect to a compute device
     int gpu = 1;
-    err = clGetDeviceIDs(NULL, gpu ? CL_DEVICE_TYPE_GPU : CL_DEVICE_TYPE_CPU, 1, &device_id, NULL);
-    if (err != CL_SUCCESS) {
+    err[0] = clGetDeviceIDs(NULL, gpu ? CL_DEVICE_TYPE_GPU : CL_DEVICE_TYPE_CPU, 1, &device_id, NULL);
+    if (err[0] != CL_SUCCESS) {
         printf("Error: Failed to create a device group!\n");
         return;
     }
 
+    // Create OpenCL context with share group
     CGLContextObj glContext = CGLGetCurrentContext();
-    CGLShareGroupObj sharegroup = CGLGetShareGroup(glContext);
+    CGLShareGroupObj shareGroup = CGLGetShareGroup(glContext);
 
     cl_context_properties props[] = {
             CL_CONTEXT_PROPERTY_USE_CGL_SHAREGROUP_APPLE,
-            (cl_context_properties)sharegroup,
+            (cl_context_properties)shareGroup,
             0
     };
 
-    // Create OpenCL context with share group
-    context = clCreateContext(props, 1, &device_id, nullptr, nullptr, &err);
-    if (err != CL_SUCCESS) {
+    context = clCreateContext(props, 1, &device_id, nullptr, nullptr, &err[0]);
+    if (err[0] != CL_SUCCESS) {
         printf("Error: Failed to create a compute context!\n");
         return;
     }
 
-    // Create a command queue
-    commands = clCreateCommandQueue(context, device_id, 0, &err);
-    if (!commands) {
+    // Create CPU and GPU device command queues
+    gpu_commands = clCreateCommandQueue(context, device_id, CL_QUEUE_PROFILING_ENABLE, &err[0]);
+    cpu_commands = clCreateCommandQueue(context, device_id, CL_QUEUE_PROFILING_ENABLE, &err[1]);
+    if (!gpu_commands || !cpu_commands) {
         printf("Error: Failed to create a command queue!\n");
         return;
     }
 
-    // ----------- GPU KERNEL ----------- //
-    // Create the compute program from the source character array
-    gpu_program = clCreateProgramWithSource(context, 1, (const char **)&gpuKernelSource, NULL, &err);
-    if (!gpu_program) {
+    // Create the compute programs from the source character arrays
+    gpu_program = clCreateProgramWithSource(context, 1, (const char **)&gpuKernelSource, NULL, &err[0]);
+    cpu_program = clCreateProgramWithSource(context, 1, (const char **)&cpuKernelSource, NULL, &err[1]);
+    if (!gpu_program || !cpu_program) {
         printf("Error: Failed to create compute gpu_program!\n");
         return;
     }
 
-    // Build the gpu_program executable
-    err = clBuildProgram(gpu_program, 0, NULL, NULL, NULL, NULL);
-    if (err != CL_SUCCESS) {
-        size_t len;
-        char buffer[2048];
-
-        printf("Error: Failed to build gpu_program executable!\n");
-        clGetProgramBuildInfo(gpu_program, device_id, CL_PROGRAM_BUILD_LOG, sizeof(buffer), buffer, &len);
-        printf("%s\n", buffer);
+    // Build the gpu_program and cpu_program executables
+    err[0] = clBuildProgram(gpu_program, 0, NULL, NULL, NULL, NULL);
+    err[1] = clBuildProgram(cpu_program, 0, NULL, NULL, NULL, NULL);
+    if (err[0] != CL_SUCCESS || err[1] != CL_SUCCESS) {
+        printf("Error: Failed to build program executable!\n");
         return;
     }
 
-    // Create the compute kernel
-    grid_update_kernel = clCreateKernel(gpu_program, "gameOfLife", &err);
-    if (!grid_update_kernel || err != CL_SUCCESS) {
-        printf("Error: Failed to create compute grid_update_kernel!\n");
+    // Create the GPU and CPU compute kernels
+    grid_update_kernel = clCreateKernel(gpu_program, "gameOfLife", &err[0]);
+    pixels_update_kernel = clCreateKernel(cpu_program, "writeToPixelBuffer", &err[1]);
+    if (!grid_update_kernel || err[0] != CL_SUCCESS || !pixels_update_kernel || err[1] != CL_SUCCESS) {
+        printf("Error: Failed to create compute kernel!\n");
         return;
     }
 
-    // Create buffers
-    old_species_ids_mem = clCreateBuffer(context, CL_MEM_READ_WRITE, sizeof(int) * WIDTH * HEIGHT, NULL, &err);
-    species_ids_mem = clCreateBuffer(context, CL_MEM_READ_WRITE, sizeof(int) * WIDTH * HEIGHT, NULL, &err);
+    // Create GPU buffers
+    grid_mem = clCreateBuffer(context, CL_MEM_READ_WRITE, sizeof(int) * WIDTH * HEIGHT, NULL, &err[0]);
+    next_grid_mem = clCreateBuffer(context, CL_MEM_READ_WRITE, sizeof(int) * WIDTH * HEIGHT, NULL, &err[0]);
 
-    if (!old_species_ids_mem || !species_ids_mem) {
+    if (!grid_mem || !next_grid_mem) {
         printf("Error: Failed to allocate device memory!\n");
         return;
     }
 
-    // ----------- CPU KERNEL ----------- //
-    // Create the compute gpu_program from the source character array
-    cpu_program = clCreateProgramWithSource(context, 1, (const char **)&cpuKernelSource, NULL, &err);
-    if (!cpu_program) {
-        printf("Error: Failed to create compute gpu_program!\n");
-        return;
-    }
+    // Create CPU buffers
+    grid_cpu_mem = clCreateBuffer(context, CL_MEM_READ_WRITE, sizeof(int) * WIDTH * HEIGHT, NULL, &err[1]);
+    pixel_buffer_mem = clCreateFromGLBuffer(context, CL_MEM_WRITE_ONLY, pixelBuffer, &err[1]);
 
-    // Build the gpu_program executable
-    err = clBuildProgram(cpu_program, 0, NULL, NULL, NULL, NULL);
-    if (err != CL_SUCCESS) {
-        size_t len;
-        char buffer[2048];
-
-        printf("Error: Failed to build gpu_program executable!\n");
-        clGetProgramBuildInfo(cpu_program, device_id, CL_PROGRAM_BUILD_LOG, sizeof(buffer), buffer, &len);
-        printf("%s\n", buffer);
-        return;
-    }
-
-    // Create the compute kernel
-    pixels_update_kernel = clCreateKernel(cpu_program, "writeToPixelBuffer", &err);
-    if (!pixels_update_kernel || err != CL_SUCCESS) {
-        printf("Error: Failed to create compute grid_update_kernel!\n");
-        return;
-    }
-
-    pixel_buffer_mem = clCreateFromGLBuffer(context, CL_MEM_WRITE_ONLY, pixelBuffer, &err);
-
-    if (!pixel_buffer_mem) {
+    if (!pixel_buffer_mem || !grid_cpu_mem) {
         printf("Error: Failed to allocate device memory!\n");
         return;
     }
+
     std::cout << "OpenCL initialized successfully!" << std::endl;
 }
 
 void cleanupOpenCL() {
-    std::cout << "Freeing memory allocated by opencl\n";
+    std::cout << "Freeing memory allocated by OpenCL\n";
 
-    // Cleanup, free allocated memory
-    if (old_species_ids_mem) clReleaseMemObject(old_species_ids_mem);
-    if (species_ids_mem) clReleaseMemObject(species_ids_mem);
+    if (grid_mem) clReleaseMemObject(grid_mem);
+    if (next_grid_mem) clReleaseMemObject(next_grid_mem);
+    if (grid_cpu_mem) clReleaseMemObject(grid_cpu_mem);
+    if (pixel_buffer_mem) clReleaseMemObject(pixel_buffer_mem);
     if (gpu_program) clReleaseProgram(gpu_program);
+    if (cpu_program) clReleaseProgram(cpu_program);
     if (grid_update_kernel) clReleaseKernel(grid_update_kernel);
-    if (commands) clReleaseCommandQueue(commands);
+    if (pixels_update_kernel) clReleaseKernel(pixels_update_kernel);
+    if (gpu_commands) clReleaseCommandQueue(gpu_commands);
+    if (cpu_commands) clReleaseCommandQueue(cpu_commands);
     if (context) clReleaseContext(context);
+
+    // Get average times
+    if(testModeEnabled) {
+        double hostWaitTimeSum = 0, kernelExecTimeSum = 0;
+        for(int i = 0; i < MAX_ITERATIONS; i++) {
+            hostWaitTimeSum += hostWaitTimeus[i];
+            kernelExecTimeSum += kernelExecutionTimeus[i];
+        }
+        std::cout << "Average host wait time: " << hostWaitTimeSum / MAX_ITERATIONS << "us\n";
+        std::cout << "Average kernel execution time " << kernelExecTimeSum / MAX_ITERATIONS << "us\n";
+    }
+}
+
+int getDesiredNumberOfSpecies() {
+    int numberOfSpecies = 0;
+    std::cout << "**********************************************************\n"
+              << "\t\t\tWelcome to Game of Life!\n"
+              << "**********************************************************\n"
+              << "Enter your desired number of species (5-10): ";
+    std::cin >> numberOfSpecies;
+
+    while(std::cin.fail() || numberOfSpecies < 5 || numberOfSpecies > 10) {
+        std::cin.clear();
+        std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n'); // Discard invalid input
+        std::cout << "Enter a valid number of species (5-10): ";
+        std::cin >> numberOfSpecies;
+    }
+
+    return numberOfSpecies;
 }
 
 void initialiseGrid() {
-    oldSpeciesIDs.resize(WIDTH * HEIGHT);
-    speciesIDs.resize(WIDTH * HEIGHT);
+    grid.resize(WIDTH * HEIGHT);
+    nextGrid.resize(WIDTH * HEIGHT);
 
     std::srand(static_cast<unsigned int>(std::time(nullptr)));
     for (int y = 0; y < HEIGHT; y++) {
@@ -185,57 +209,11 @@ void initialiseGrid() {
             int cellIndex = y * WIDTH + x;
             // Species ID ranges from 1 to NUMBER_OF_SPECIES
             int speciesID = std::rand() % NUMBER_OF_SPECIES + 1;
-            oldSpeciesIDs[cellIndex]= speciesID;
+            grid[cellIndex]= speciesID;
         }
     }
 
-    speciesIDs = oldSpeciesIDs;
-}
-
-void updateGridState() {
-    // Swap grid buffers
-    swap(speciesIDs, oldSpeciesIDs);
-
-    cl_int err;
-
-    // Copy current grid data to device
-    err = clEnqueueWriteBuffer(commands, old_species_ids_mem, CL_TRUE, 0,
-                               sizeof(int) * WIDTH * HEIGHT, oldSpeciesIDs.data(), 0, NULL, NULL);
-    if (err != CL_SUCCESS) {
-        printf("Error: Failed to write to device memory!\n");
-        return;
-    }
-
-    // Set kernel arguments
-    err = 0;
-    err |= clSetKernelArg(grid_update_kernel, 0, sizeof(cl_mem), &old_species_ids_mem);
-    err |= clSetKernelArg(grid_update_kernel, 1, sizeof(cl_mem), &species_ids_mem);
-    err |= clSetKernelArg(grid_update_kernel, 2, sizeof(int), &WIDTH);
-    err |= clSetKernelArg(grid_update_kernel, 3, sizeof(int), &HEIGHT);
-    err |= clSetKernelArg(grid_update_kernel, 4, sizeof(int), &NUMBER_OF_SPECIES);
-    if (err != CL_SUCCESS) {
-        printf("Error: Failed to set grid_update_kernel arguments! %d\n", err);
-        return;
-    }
-
-    // Create a 2D array of WIDTH * HEIGHT work items
-    size_t globalWorkSize[2] = {WIDTH, HEIGHT};
-    // Execute the grid_update_kernel
-    err = clEnqueueNDRangeKernel(commands, grid_update_kernel, 2, NULL, globalWorkSize, NULL, 0, NULL, NULL);
-    if (err) {
-        printf("Error: Failed to execute grid_update_kernel!\n");
-        return;
-    }
-
-    // Wait for device to service commands
-    clFinish(commands);
-
-    // Read back the results from the device
-    err |= clEnqueueReadBuffer(commands, species_ids_mem, CL_TRUE, 0, sizeof(int) * WIDTH * HEIGHT, speciesIDs.data(), 0, NULL, NULL);
-    if (err != CL_SUCCESS) {
-        printf("Error: Failed to read output arrays! %d\n", err);
-        return;
-    }
+    nextGrid = grid;
 }
 
 void initialiseOpenGL(int argc, char** argv) {
@@ -245,19 +223,11 @@ void initialiseOpenGL(int argc, char** argv) {
     glutInitWindowPosition(100, 100);
     glutCreateWindow("Game of Life");
 
-    // Initialise GLEW
-    GLenum err = glewInit();
-    if (GLEW_OK != err) {
-        std::cerr << "GLEW Error: " << glewGetErrorString(err) << std::endl;
-        return;
-    }
-
-    // Set up pixel buffer object
-    gridData = new GLubyte[WIDTH * HEIGHT * 3];
-    glGenBuffers(1, &pixelBuffer);
-    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pixelBuffer);
-    glBufferData(GL_PIXEL_UNPACK_BUFFER,WIDTH * HEIGHT * 3, nullptr, GL_STREAM_DRAW);
-    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+    // Create Pixel Buffer Object (PBO)
+    glGenBuffers(1, &pixelBuffer); // Create 1 buffer object, store its ID in pixelBuffer
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pixelBuffer); // Bind buffer to its ID
+    glBufferData(GL_PIXEL_UNPACK_BUFFER,WIDTH * HEIGHT * 3, nullptr, GL_STREAM_DRAW); // Allocate (WIDTH * HEIGHT * 3) bytes to PBO
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0); // Unbind PBO
 
     // Set callbacks
     glutDisplayFunc(displayFunc);
@@ -275,11 +245,25 @@ void displayFunc() {
     glutSwapBuffers();
 }
 
+// "Host program"
 void idleFunc() {
-    updateGridState();
-    //setPixelsNoCL();
-    setPixels();
-    glutPostRedisplay();
+
+    uint returnVal = playGameOfLife();
+
+    if(returnVal != 0) {
+        glutPostRedisplay();
+    }
+    else {
+        std::cout << "Something went wrong with the OpenCL setup and execution, exiting program\n";
+        exit(0);
+    }
+
+    if(testModeEnabled) {
+        iteration++;
+        if(iteration >= MAX_ITERATIONS) {
+            exit(0);
+        }
+    }
 }
 
 void keyboardFunc(unsigned char key, int x, int y) {
@@ -289,64 +273,124 @@ void keyboardFunc(unsigned char key, int x, int y) {
     }
 }
 
-void setPixels() {
-    cl_int err = clEnqueueAcquireGLObjects(commands, 1, &pixel_buffer_mem, 0, nullptr, nullptr);
 
-    err |= clSetKernelArg(pixels_update_kernel, 0, sizeof(cl_mem), &species_ids_mem);
-    err |= clSetKernelArg(pixels_update_kernel, 1, sizeof(cl_mem), &pixel_buffer_mem);
-    err |= clSetKernelArg(pixels_update_kernel, 2, sizeof(int), &WIDTH);
-    err |= clSetKernelArg(pixels_update_kernel, 3, sizeof(int), &HEIGHT);
+uint playGameOfLife() {
+    cl_int err;
+    cl_event profiling_events[2];
 
+    // ----------------- Swap host buffers -----------------
+    std::swap(nextGrid, grid);
+
+    // ----------------- Write grid N to GPU buffer -----------------
+    err = clEnqueueWriteBuffer(gpu_commands, grid_mem, CL_TRUE, 0,
+                               sizeof(int) * WIDTH * HEIGHT,
+                               grid.data(), 0, NULL, NULL);
     if (err != CL_SUCCESS) {
-        printf("Error: Failed to set grid_update_kernel arguments! %d\n", err);
-        return;
+        printf("Error: Failed to write grid to GPU memory!\n");
+        return 0;
     }
 
-    // Create a 2D array of WIDTH * HEIGHT work items
-    size_t globalWorkSize[2] = {WIDTH, HEIGHT};
-    // Execute the grid_update_kernel
-    err = clEnqueueNDRangeKernel(commands, pixels_update_kernel, 2, NULL, globalWorkSize, NULL, 0, NULL, NULL);
-    if (err) {
-        printf("Error: Failed to execute grid_update_kernel!\n");
-        return;
+    // ----------------- Execute GPU kernel -----------------
+    size_t global[2] = {WIDTH, HEIGHT};
+
+    clSetKernelArg(grid_update_kernel, 0, sizeof(cl_mem), &grid_mem);
+    clSetKernelArg(grid_update_kernel, 1, sizeof(cl_mem), &next_grid_mem);
+    clSetKernelArg(grid_update_kernel, 2, sizeof(int), &WIDTH);
+    clSetKernelArg(grid_update_kernel, 3, sizeof(int), &HEIGHT);
+    clSetKernelArg(grid_update_kernel, 4, sizeof(int), &NUMBER_OF_SPECIES);
+
+    // Start host side timer
+    auto start = std::chrono::system_clock::now();
+    err = clEnqueueNDRangeKernel(gpu_commands, grid_update_kernel,
+                                 2, NULL, global, NULL, 0, NULL, &profiling_events[0]);
+    if (err != CL_SUCCESS) {
+        printf("Error: Failed to launch compute kernel!\n");
+        return 0;
     }
 
-    clEnqueueReleaseGLObjects(commands, 1, &pixel_buffer_mem, 0, nullptr, nullptr);
-    clFinish(commands);
-}
-
-void setPixelsNoCL() {
-    for(int y = 0; y < HEIGHT; y++) {
-        for(int x = 0; x < WIDTH; x++) {
-            int cellIndex = y * WIDTH + x;
-            int speciesID = oldSpeciesIDs[cellIndex];
-            // Map speciesID to RGB color
-            GLubyte r, g, b;
-            switch (speciesID) {
-                case -1:   r = 53;  g = 27;  b = 8;    break;  // DEAD: Saddle brown
-                case 1:    r = 216; g = 191; b = 216;  break;  // SPECIES 1: Thistle
-                case 2:    r = 95;  g = 158; b = 160;  break;  // SPECIES 2: Cadet blue
-                case 3:    r = 46;  g = 139; b = 87;   break;  // SPECIES 3: Sea green
-                case 4:    r = 245; g = 222; b = 179;  break;  // SPECIES 4: Wheat
-                case 5:    r = 189; g = 183; b = 107;  break;  // SPECIES 5: Dark khaki
-                case 6:    r = 255; g = 215; b = 0;    break;  // SPECIES 6: Gold
-                case 7:    r = 255; g = 69;  b = 0;    break;  // SPECIES 7: Orange red
-                case 8:    r = 178; g = 34;  b = 34;   break;  // SPECIES 8: Firebrick
-                case 9:    r = 219; g = 112; b = 147;  break;  // SPECIES 9: Pale violet red
-                case 10:   r = 139; g = 0;   b = 0;    break;  // SPECIES 10: Dark red
-                default:   r = 255; g = 0;   b = 255;  break;  // ERROR: Magenta
-            }
-
-            // Update CPU pixel buffer (row-major RGB)
-            int pixelIndex = cellIndex * 3;
-            gridData[pixelIndex]     = r;
-            gridData[pixelIndex + 1] = g;
-            gridData[pixelIndex + 2] = b;
-        }
+    // ----------------- Write grid N to "CPU" buffer -----------------
+    err = clEnqueueWriteBuffer(cpu_commands, grid_cpu_mem, CL_TRUE, 0,
+                               sizeof(int) * WIDTH * HEIGHT,
+                               grid.data(), 0, NULL, NULL);
+    if (err != CL_SUCCESS) {
+        printf("Error: Failed to write CPU-grid buffer!\n");
+        return 0;
     }
 
-    // Upload the CPU buffer to the OpenGL pixel buffer
-    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pixelBuffer);
-    glBufferSubData(GL_PIXEL_UNPACK_BUFFER, 0, WIDTH * HEIGHT * 3, gridData);
-    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+    // ----------------- Acquire OpenGL PBO for "CPU" kernel -----------------
+    err = clEnqueueAcquireGLObjects(cpu_commands,
+                                    1, &pixel_buffer_mem,
+                                    0, NULL, NULL);
+    if (err != CL_SUCCESS) {
+        printf("Error: Failed to acquire GL buffer!\n");
+        return 0;
+    }
+
+    // ----------------- Execute "CPU" kernel -----------------
+    clSetKernelArg(pixels_update_kernel, 0, sizeof(cl_mem), &grid_cpu_mem);
+    clSetKernelArg(pixels_update_kernel, 1, sizeof(cl_mem), &pixel_buffer_mem);
+    clSetKernelArg(pixels_update_kernel, 2, sizeof(int), &WIDTH);
+    clSetKernelArg(pixels_update_kernel, 3, sizeof(int), &HEIGHT);
+
+    err = clEnqueueNDRangeKernel(cpu_commands, pixels_update_kernel,
+                                 2, NULL, global, NULL,
+                                 0, NULL, &profiling_events[1]);
+    if (err != CL_SUCCESS) {
+        printf("Error: Failed to launch pixel kernel!\n");
+        return 0;
+    }
+
+    // ----------------- Release OpenGL PBO -----------------
+    clEnqueueReleaseGLObjects(cpu_commands, 1, &pixel_buffer_mem, 0, NULL, NULL);
+
+    // ----------------- Wait for GPU and "CPU" devices to service their commands -----------------
+    clFinish(gpu_commands);
+    clFinish(cpu_commands);
+
+    // Stop host-side timer
+    auto end = std::chrono::system_clock::now();
+
+    // Print host-side computation time
+    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+
+    // ----------------- Get kernel runtimes -----------------
+    clWaitForEvents(2, profiling_events);
+    // Get kernel start and end times in nanoseconds
+    cl_ulong gpu_kernel_start, gpu_kernel_end, cpu_kernel_start, cpu_kernel_end;
+    size_t return_bytes;
+    err = clGetEventProfilingInfo(profiling_events[0], CL_PROFILING_COMMAND_START, sizeof(cl_long), &gpu_kernel_start, &return_bytes);
+    err |= clGetEventProfilingInfo(profiling_events[0], CL_PROFILING_COMMAND_END, sizeof(cl_long), &gpu_kernel_end, &return_bytes);
+    err |= clGetEventProfilingInfo(profiling_events[1], CL_PROFILING_COMMAND_START, sizeof(cl_long), &cpu_kernel_start, &return_bytes);
+    err |= clGetEventProfilingInfo(profiling_events[1], CL_PROFILING_COMMAND_END, sizeof(cl_long), &cpu_kernel_end, &return_bytes);
+    if (err != CL_SUCCESS) {
+        printf("Error: Failed to get event profiling info!\n");
+        return 0;
+    }
+    double gpuKernelRuntime, cpuKernelRuntime, totalRuntime;
+    gpuKernelRuntime = (double)(gpu_kernel_end - gpu_kernel_start) / 1000.0;
+    cpuKernelRuntime = (double)(cpu_kernel_end - cpu_kernel_start) / 1000.0;
+    totalRuntime = gpuKernelRuntime + cpuKernelRuntime;
+
+    if(testModeEnabled) {
+        hostWaitTimeus[iteration] = duration.count();
+        kernelExecutionTimeus[iteration] = totalRuntime;
+    }
+
+    std::cout << "Kernel Runtime Info:\n";
+    std::cout << "\tGPU next grid computation:\t\t\t" << gpuKernelRuntime << "us\n";
+    std::cout << "\tCPU pixels:\t\t\t\t\t\t\t" << cpuKernelRuntime << "us\n";
+    std::cout << "\tTotal runtime (sequential):\t\t\t" << totalRuntime << "us\n";
+    std::cout << "\tTotal runtime (parallel):\t\t\t" << std::max(gpuKernelRuntime, cpuKernelRuntime) << "us\n";
+    std::cout << "\tHost side wait time (sequential):\t" << duration.count() << "us\n";
+
+    // ----------------- Read grid N+1 -----------------
+    err = clEnqueueReadBuffer(gpu_commands, next_grid_mem, CL_TRUE, 0,
+                              sizeof(int) * WIDTH * HEIGHT,
+                              nextGrid.data(), 0, NULL, NULL);
+    if (err != CL_SUCCESS) {
+        printf("Error: Failed to read back updated grid!\n");
+        return 0;
+    }
+
+    return 1;
 }
