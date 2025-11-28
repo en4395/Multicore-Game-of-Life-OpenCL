@@ -6,6 +6,11 @@
  *      - The family of PCG (permuted congruential generator) algorithms was developed by M.E. O'Neill
  * - Creating and using Pixel Buffer Objects (PBOs): https://www.songho.ca/opengl/gl_vbo.html#create
  * - Profiling with events: Lecture slides
+ * - Mapping OpenGL pixel buffer to host: https://registry.khronos.org/OpenGL-Refpages/gl4/html/glMapBuffer.xhtml
+ *
+ * Disclaimer: I used generative AI to write the GLUT window setup logic
+ * I found the examples in this resource particularly useful in understanding some GLUT basics:
+ * https://cs.lmu.edu/~ray/notes/openglexamples/
  **/
 
 #include <iostream>
@@ -28,43 +33,42 @@ cl_kernel pixels_update_kernel;
 cl_mem grid_mem;
 cl_mem grid_cpu_mem;
 cl_mem next_grid_mem;
-cl_mem pixel_buffer_mem;
+cl_mem cpu_pixel_buffer_mem;
+
 void initialiseOpenCL();
 void cleanupOpenCL();
+void getTimingInfo(cl_event *profiling_events, double hostWaitTime);
 
 // ----------- GAME OF LIFE ----------- //
 std::vector<int> grid;          // Previous species IDs
 std::vector<int> nextGrid;      // Updated species IDs
+
 int getDesiredNumberOfSpecies();
 void initialiseGrid();
 uint playGameOfLife();
 
 // ----------- OPENGL ----------- //
 GLuint pixelBuffer;
+
 void initialiseOpenGL(int argc, char** argv);
 void displayFunc();             // Display callback
 void idleFunc();                // Idle callback
 void keyboardFunc(unsigned char key, int x, int y); // Keyboard callback
 
 // ----------- TEST VARIABLES ----------- //
-bool testModeEnabled = true;
-std::vector<double>hostWaitTimeus;
-std::vector<double>kernelExecutionTimeus;
+bool testModeEnabled = false;
 int iteration = 0;
-int MAX_ITERATIONS = 100;
+const int MAX_ITERATIONS = 100;
+double hostWaitTimeus[MAX_ITERATIONS];
+double kernelExecutionTimeus[MAX_ITERATIONS];
 
 int main(int argc, char** argv) {
     NUMBER_OF_SPECIES = getDesiredNumberOfSpecies();
 
-    if(testModeEnabled) {
-        // Initialise test buffers
-        hostWaitTimeus.resize(MAX_ITERATIONS);
-        kernelExecutionTimeus.resize(MAX_ITERATIONS);
-    }
-
     // Register cleanup function
     atexit(cleanupOpenCL);
 
+    // Initialisation
     initialiseOpenGL(argc, argv);
     initialiseOpenCL();
     initialiseGrid();
@@ -85,23 +89,14 @@ void initialiseOpenCL() {
         return;
     }
 
-    // Create OpenCL context with share group
-    CGLContextObj glContext = CGLGetCurrentContext();
-    CGLShareGroupObj shareGroup = CGLGetShareGroup(glContext);
-
-    cl_context_properties props[] = {
-            CL_CONTEXT_PROPERTY_USE_CGL_SHAREGROUP_APPLE,
-            (cl_context_properties)shareGroup,
-            0
-    };
-
-    context = clCreateContext(props, 1, &device_id, nullptr, nullptr, &err[0]);
-    if (err[0] != CL_SUCCESS) {
+    // Create a compute context
+    context = clCreateContext(0, 1, &device_id, NULL, NULL, &err[0]);
+    if (!context) {
         printf("Error: Failed to create a compute context!\n");
         return;
     }
 
-    // Create CPU and GPU device command queues
+    // Create "CPU" and GPU device command queues
     gpu_commands = clCreateCommandQueue(context, device_id, CL_QUEUE_PROFILING_ENABLE, &err[0]);
     cpu_commands = clCreateCommandQueue(context, device_id, CL_QUEUE_PROFILING_ENABLE, &err[1]);
     if (!gpu_commands || !cpu_commands) {
@@ -125,7 +120,7 @@ void initialiseOpenCL() {
         return;
     }
 
-    // Create the GPU and CPU compute kernels
+    // Create the GPU and "CPU" compute kernels
     grid_update_kernel = clCreateKernel(gpu_program, "gameOfLife", &err[0]);
     pixels_update_kernel = clCreateKernel(cpu_program, "writeToPixelBuffer", &err[1]);
     if (!grid_update_kernel || err[0] != CL_SUCCESS || !pixels_update_kernel || err[1] != CL_SUCCESS) {
@@ -142,11 +137,11 @@ void initialiseOpenCL() {
         return;
     }
 
-    // Create CPU buffers
+    // Create "CPU" buffers
     grid_cpu_mem = clCreateBuffer(context, CL_MEM_READ_WRITE, sizeof(int) * WIDTH * HEIGHT, NULL, &err[1]);
-    pixel_buffer_mem = clCreateFromGLBuffer(context, CL_MEM_WRITE_ONLY, pixelBuffer, &err[1]);
+    cpu_pixel_buffer_mem = clCreateBuffer(context, CL_MEM_WRITE_ONLY, sizeof(unsigned char) * WIDTH * HEIGHT * 3, NULL, &err[1]);
 
-    if (!pixel_buffer_mem || !grid_cpu_mem) {
+    if (!grid_cpu_mem || !cpu_pixel_buffer_mem) {
         printf("Error: Failed to allocate device memory!\n");
         return;
     }
@@ -160,7 +155,7 @@ void cleanupOpenCL() {
     if (grid_mem) clReleaseMemObject(grid_mem);
     if (next_grid_mem) clReleaseMemObject(next_grid_mem);
     if (grid_cpu_mem) clReleaseMemObject(grid_cpu_mem);
-    if (pixel_buffer_mem) clReleaseMemObject(pixel_buffer_mem);
+    if (cpu_pixel_buffer_mem) clReleaseMemObject(cpu_pixel_buffer_mem);
     if (gpu_program) clReleaseProgram(gpu_program);
     if (cpu_program) clReleaseProgram(cpu_program);
     if (grid_update_kernel) clReleaseKernel(grid_update_kernel);
@@ -169,7 +164,7 @@ void cleanupOpenCL() {
     if (cpu_commands) clReleaseCommandQueue(cpu_commands);
     if (context) clReleaseContext(context);
 
-    // Get average times
+    // Get average computation times
     if(testModeEnabled) {
         double hostWaitTimeSum = 0, kernelExecTimeSum = 0;
         for(int i = 0; i < MAX_ITERATIONS; i++) {
@@ -247,7 +242,6 @@ void displayFunc() {
 
 // "Host program"
 void idleFunc() {
-
     uint returnVal = playGameOfLife();
 
     if(returnVal != 0) {
@@ -317,18 +311,9 @@ uint playGameOfLife() {
         return 0;
     }
 
-    // ----------------- Acquire OpenGL PBO for "CPU" kernel -----------------
-    err = clEnqueueAcquireGLObjects(cpu_commands,
-                                    1, &pixel_buffer_mem,
-                                    0, NULL, NULL);
-    if (err != CL_SUCCESS) {
-        printf("Error: Failed to acquire GL buffer!\n");
-        return 0;
-    }
-
     // ----------------- Execute "CPU" kernel -----------------
     clSetKernelArg(pixels_update_kernel, 0, sizeof(cl_mem), &grid_cpu_mem);
-    clSetKernelArg(pixels_update_kernel, 1, sizeof(cl_mem), &pixel_buffer_mem);
+    clSetKernelArg(pixels_update_kernel, 1, sizeof(cl_mem), &cpu_pixel_buffer_mem);
     clSetKernelArg(pixels_update_kernel, 2, sizeof(int), &WIDTH);
     clSetKernelArg(pixels_update_kernel, 3, sizeof(int), &HEIGHT);
 
@@ -339,9 +324,6 @@ uint playGameOfLife() {
         printf("Error: Failed to launch pixel kernel!\n");
         return 0;
     }
-
-    // ----------------- Release OpenGL PBO -----------------
-    clEnqueueReleaseGLObjects(cpu_commands, 1, &pixel_buffer_mem, 0, NULL, NULL);
 
     // ----------------- Wait for GPU and "CPU" devices to service their commands -----------------
     clFinish(gpu_commands);
@@ -355,33 +337,7 @@ uint playGameOfLife() {
 
     // ----------------- Get kernel runtimes -----------------
     clWaitForEvents(2, profiling_events);
-    // Get kernel start and end times in nanoseconds
-    cl_ulong gpu_kernel_start, gpu_kernel_end, cpu_kernel_start, cpu_kernel_end;
-    size_t return_bytes;
-    err = clGetEventProfilingInfo(profiling_events[0], CL_PROFILING_COMMAND_START, sizeof(cl_long), &gpu_kernel_start, &return_bytes);
-    err |= clGetEventProfilingInfo(profiling_events[0], CL_PROFILING_COMMAND_END, sizeof(cl_long), &gpu_kernel_end, &return_bytes);
-    err |= clGetEventProfilingInfo(profiling_events[1], CL_PROFILING_COMMAND_START, sizeof(cl_long), &cpu_kernel_start, &return_bytes);
-    err |= clGetEventProfilingInfo(profiling_events[1], CL_PROFILING_COMMAND_END, sizeof(cl_long), &cpu_kernel_end, &return_bytes);
-    if (err != CL_SUCCESS) {
-        printf("Error: Failed to get event profiling info!\n");
-        return 0;
-    }
-    double gpuKernelRuntime, cpuKernelRuntime, totalRuntime;
-    gpuKernelRuntime = (double)(gpu_kernel_end - gpu_kernel_start) / 1000.0;
-    cpuKernelRuntime = (double)(cpu_kernel_end - cpu_kernel_start) / 1000.0;
-    totalRuntime = gpuKernelRuntime + cpuKernelRuntime;
-
-    if(testModeEnabled) {
-        hostWaitTimeus[iteration] = duration.count();
-        kernelExecutionTimeus[iteration] = totalRuntime;
-    }
-
-    std::cout << "Kernel Runtime Info:\n";
-    std::cout << "\tGPU next grid computation:\t\t\t" << gpuKernelRuntime << "us\n";
-    std::cout << "\tCPU pixels:\t\t\t\t\t\t\t" << cpuKernelRuntime << "us\n";
-    std::cout << "\tTotal runtime (sequential):\t\t\t" << totalRuntime << "us\n";
-    std::cout << "\tTotal runtime (parallel):\t\t\t" << std::max(gpuKernelRuntime, cpuKernelRuntime) << "us\n";
-    std::cout << "\tHost side wait time (sequential):\t" << duration.count() << "us\n";
+    getTimingInfo(profiling_events, duration.count());
 
     // ----------------- Read grid N+1 -----------------
     err = clEnqueueReadBuffer(gpu_commands, next_grid_mem, CL_TRUE, 0,
@@ -392,5 +348,46 @@ uint playGameOfLife() {
         return 0;
     }
 
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pixelBuffer);
+    // Map PBO data to the host's address space
+    GLubyte* pboPtr = (GLubyte*)glMapBuffer(GL_PIXEL_UNPACK_BUFFER, GL_WRITE_ONLY);
+    if(pboPtr) {
+        // Read pixels from cpu device memory into PBO pointer in host memory
+        clEnqueueReadBuffer(cpu_commands, cpu_pixel_buffer_mem, CL_TRUE, 0, sizeof(unsigned char) * WIDTH * HEIGHT * 3, pboPtr, 0, NULL, NULL);
+        glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER);
+    }
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+
     return 1;
+}
+
+void getTimingInfo(cl_event *profiling_events, double hostWaitTime) {
+    cl_ulong gpu_kernel_start, gpu_kernel_end, cpu_kernel_start, cpu_kernel_end;
+    size_t return_bytes;
+    cl_uint err;
+
+    err = clGetEventProfilingInfo(profiling_events[0], CL_PROFILING_COMMAND_START, sizeof(cl_long), &gpu_kernel_start, &return_bytes);
+    err |= clGetEventProfilingInfo(profiling_events[0], CL_PROFILING_COMMAND_END, sizeof(cl_long), &gpu_kernel_end, &return_bytes);
+    err |= clGetEventProfilingInfo(profiling_events[1], CL_PROFILING_COMMAND_START, sizeof(cl_long), &cpu_kernel_start, &return_bytes);
+    err |= clGetEventProfilingInfo(profiling_events[1], CL_PROFILING_COMMAND_END, sizeof(cl_long), &cpu_kernel_end, &return_bytes);
+    if(err != CL_SUCCESS) {
+        std::cout << "Error: Could not get event profiling info!\n";
+    }
+
+    double gpuKernelRuntime, cpuKernelRuntime, totalRuntime;
+    gpuKernelRuntime = (double)(gpu_kernel_end - gpu_kernel_start) / 1000.0;
+    cpuKernelRuntime = (double)(cpu_kernel_end - cpu_kernel_start) / 1000.0;
+    totalRuntime = gpuKernelRuntime + cpuKernelRuntime;
+
+    if(testModeEnabled) {
+        hostWaitTimeus[iteration] = hostWaitTime;
+        kernelExecutionTimeus[iteration] = totalRuntime;
+    }
+
+    std::cout << "Kernel Runtime Info:\n";
+    std::cout << "\tGPU next grid computation:\t\t\t" << gpuKernelRuntime << "us\n";
+    std::cout << "\tCPU pixels:\t\t\t\t\t\t\t" << cpuKernelRuntime << "us\n";
+    std::cout << "\tTotal runtime (sequential):\t\t\t" << totalRuntime << "us\n";
+    std::cout << "\tTotal runtime (parallel):\t\t\t" << std::max(gpuKernelRuntime, cpuKernelRuntime) << "us\n";
+    std::cout << "\tHost side wait time (sequential):\t" << hostWaitTime << "us\n";
 }
