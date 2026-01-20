@@ -93,7 +93,7 @@ const char *gpuKernelSource = R"(
 
 const char *cpuKernelSource = R"(
         __kernel void writeToPixelBuffer(__global const int* species_data,
-                                __global uchar *pixel_buffer,
+                                __global uchar *cpu_pixel_buffer,
                                 const int width, const int height) {
 
             int x = get_global_id(0);
@@ -145,10 +145,11 @@ const char *cpuKernelSource = R"(
                     cellColour = (uchar3)(255, 0, 255); // ERROR: Magenta
             }
 
-            int pixelIndex = cellIndex * 3;
-            pixel_buffer[pixelIndex + 0] = cellColour.x;
-            pixel_buffer[pixelIndex + 1] = cellColour.y;
-            pixel_buffer[pixelIndex + 2] = cellColour.z;
+            // Each cell is 3 bytes in pixel buffer (r, g, b)
+            int pixelBufferIndex = cellIndex * 3;
+            cpu_pixel_buffer[pixelBufferIndex + 0] = cellColour.x;
+            cpu_pixel_buffer[pixelBufferIndex + 1] = cellColour.y;
+            cpu_pixel_buffer[pixelBufferIndex + 2] = cellColour.z;
         }
 )";
 
