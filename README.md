@@ -4,5 +4,5 @@ This project implements Conway's Game of Life simulation using a heterogenous CP
 does some pre-processing for the rendering (assigning colours to live pixels), then submits the next frame buffer to OpenGL for rendering.
 
 <p align="center">
-  <img src="https://github.com/en4395/Photo-Dump/blob/main/GAME_OF_LIFE.gif" alt="Game of Life Simulation"  width="300" />
+  <img src="https://github.com/en4395/Photo-Dump/blob/main/GAME_OF_LIFE.gif" alt="Game of Life Simulation"  width="500" />
 </p>
